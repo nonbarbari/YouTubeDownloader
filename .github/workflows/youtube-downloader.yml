@@ -144,6 +144,9 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           fetch-depth: 0
 
+      - name: Initialize log file
+        run: touch $LOG_FILE
+
       - name: 🗑️ Delete downloads folder
         run: |
           echo "[$(date -Is)] Clean action triggered" >> $LOG_FILE
@@ -160,6 +163,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "bot@github.com"
           git add -A
+          git add -f $LOG_FILE
           if git diff --cached --quiet; then
             echo "No changes to commit." | tee -a $LOG_FILE
             exit 0
@@ -190,6 +194,9 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           fetch-depth: 0
 
+      - name: Initialize log file
+        run: touch $LOG_FILE
+
       - name: 🧰 System dependencies
         run: |
           sudo apt-get update -qq
@@ -214,9 +221,9 @@ jobs:
       - name: 🎯 Run download (logging)
         id: run
         run: |
-          echo "" > $LOG_FILE
+          # Recreate log file (empty) to avoid appending to previous runs
+          > $LOG_FILE
           python3 scripts/main.py 2>&1 | tee -a $LOG_FILE
-        # continue even if script fails, so we commit the log
         continue-on-error: true
 
       - name: 📤 Commit & Push always (including log)
@@ -225,7 +232,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "bot@github.com"
           git add -A
-          # force-add log file even if .gitignore might skip it
+          # Ensure log file is staged even if initially untracked/ignored
           git add -f $LOG_FILE
           if git diff --cached --quiet; then
             echo "No changes to commit." | tee -a $LOG_FILE
@@ -313,8 +320,8 @@ jobs:
           retention-days: 1
 
   assemble:
-    needs: download-chunks
-    if: ${{ always() && needs.download-chunks.result != 'failure' && needs.download-chunks.result != 'cancelled' }}
+    needs: [prep-playlist, download-chunks]
+    if: ${{ always() && needs.prep-playlist.result == 'success' && needs.download-chunks.result != 'failure' && needs.download-chunks.result != 'cancelled' }}
     name: 🧩 Assemble & Push
     runs-on: ${{ github.event.inputs.runner || 'ubuntu-latest' }}
     permissions:
@@ -324,6 +331,8 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           fetch-depth: 0
+      - name: Initialize log file
+        run: touch $LOG_FILE
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
@@ -348,7 +357,7 @@ jobs:
       - name: Merge & index
         id: run
         run: |
-          echo "" > $LOG_FILE
+          > $LOG_FILE
           python3 scripts/main.py --assemble 2>&1 | tee -a $LOG_FILE
         continue-on-error: true
       - name: 📤 Commit & Push always (including log)
