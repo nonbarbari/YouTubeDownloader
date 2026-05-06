@@ -1,0 +1,25 @@
+// scripts/config.json
+{
+  "parallel_downloads": 2,
+  "max_retries": 5,
+  "retry_backoff_base": 10,
+  "archive_state_file": ".archive_state.json",
+  "cache_dirs": {
+    "pip": "~/.cache/pip",
+    "ytdlp": "~/.cache/yt-dlp"
+  },
+  "quality_fallbacks": [2160, 1440, 1080, 720, 480, 360, 144],
+  "codec_priority": {
+    "h264": ["avc1.*", "h264"],
+    "h265": ["hev1.*", "hvc1.*", "hevc"],
+    "av1": ["av01.*", "av1"],
+    "vp9": ["vp09.*", "vp9"]
+  },
+  "container_map": {
+    "mp4": "mp4",
+    "mkv": "mkv",
+    "webm": "webm"
+  },
+  "audio_formats": ["mp3", "m4a"],
+  "default_audio_format": "mp3"
+}
