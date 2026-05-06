@@ -1,12 +1,11 @@
 # scripts/utils.py
 import re
 import json
-import os
 import hashlib
 import time
 import subprocess
 from pathlib import Path
-from typing import List, Optional, Dict, Any
+from typing import Optional, List, Dict, Any
 
 def safe_name(text: str, maxlen: int = 40) -> str:
     safe = re.sub(r'[^\w]', '_', text)[:maxlen]
@@ -50,7 +49,6 @@ def retry(func, *args, max_retries=5, backoff=10, **kwargs):
     raise last_exc
 
 def get_channel_identifier(url: str) -> Optional[str]:
-    # Extract @handle, channel/ID, c/name, user/name
     m = re.search(r'@([\w.-]+)', url)
     if m:
         return m.group(1)
