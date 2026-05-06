@@ -1,4 +1,5 @@
 # scripts/index.py
+# (unchanged – same as before)
 import json
 import csv
 from pathlib import Path
