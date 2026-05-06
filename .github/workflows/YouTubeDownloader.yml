@@ -1,5 +1,6 @@
 name: 🎯 YouTube Downloader
 
+
 on:
   workflow_dispatch:
     inputs:
@@ -9,12 +10,14 @@ on:
         type: choice
         options:
           - single
+          - multi
           - playlist
           - channel
           - search
         default: 'single'
       url:
-        description: '🎬 URL or Search Query or channel name (@ChannelName or ChannelName)'
+        description: '🎬 URL or Search Query or channel name (@ChannelName or ChannelName)
+                     (For "multi" mode, paste multiple URLs separated by space/newline)'
         required: true
         type: string
       type:
@@ -41,9 +44,11 @@ on:
         type: number
         default: 50
 
+
 env:
   PYTHONUNBUFFERED: '1'
   DEBIAN_FRONTEND: 'noninteractive'
+
 
 jobs:
   download-and-process:
@@ -79,7 +84,7 @@ jobs:
           echo "URL=$U" >> $GITHUB_OUTPUT
           echo "MODE=$M" >> $GITHUB_OUTPUT
 
-      - name: 🎯 Download & Process
+      - name: 🎯 Download & Process (Incremental Push)
         id: main
         env:
           MODE: ${{ steps.prep.outputs.MODE }}
@@ -94,6 +99,10 @@ jobs:
           import requests as rq
           from pathlib import Path
           from datetime import datetime
+
+          # Initialize Git config once
+          subprocess.run(['git', 'config', 'user.name', 'github-actions[bot]'], check=True)
+          subprocess.run(['git', 'config', 'user.email', 'bot@github.com'], check=True)
 
           M = os.environ['MODE']
           U = os.environ['URL']
@@ -126,7 +135,6 @@ jobs:
               except: return str(n)
 
           def gv(vid):
-              """Get video info AND channel name from actual video data"""
               try:
                   r = subprocess.run(
                       ['yt-dlp', '--dump-json', '--no-warnings', '--no-check-certificate',
@@ -141,11 +149,9 @@ jobs:
                       duration = d.get('duration', 0)
                       channel_url = d.get('channel_url', '') or d.get('uploader_url', '')
                       handle = None
-                      # Try to get @handle from channel_url
                       if channel_url:
                           m = re.search(r'@([\w-]+)', channel_url)
                           if m: handle = m.group(1)
-                      # Fallback: use channel name as folder name
                       if not handle:
                           handle = safe_name(channel, 30) if channel and channel != 'Unknown' else None
                       return (channel.strip() if channel else 'Unknown', views, int(duration) if duration else 0, handle)
@@ -153,25 +159,18 @@ jobs:
               return ('Unknown', None, 0, None)
 
           def get_channel_from_url(url):
-              """Extract channel identifier from any YouTube URL"""
-              # Try @handle
               m = re.search(r'@([\w-]+)', url)
               if m: return m.group(1)
-              # Try channel/ID
               m = re.search(r'channel/([\w-]+)', url)
               if m: return m.group(1)
-              # Try c/name
               m = re.search(r'c/([\w-]+)', url)
               if m: return m.group(1)
-              # Try /user/name
               m = re.search(r'user/([\w-]+)', url)
               if m: return m.group(1)
               return None
 
           def get_channel_from_playlist(playlist_url):
-              """Get the actual channel name from a playlist by looking at its first video"""
               try:
-                  # Get first video from playlist
                   cmd = ['yt-dlp', '--flat-playlist', '--dump-json', '--playlist-end', '1',
                          '--no-warnings', '--no-check-certificate', playlist_url]
                   r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
@@ -181,23 +180,16 @@ jobs:
                       if vid:
                           _, _, _, handle = gv(vid)
                           if handle: return handle
-                      # Fallback to uploader/channel from flat data
                       ch = d.get('channel') or d.get('uploader') or d.get('uploader_id')
                       if ch: return safe_name(ch, 30)
               except: pass
               return None
 
           def gvl(u, n):
-              """Get video list - returns (videos, channel_folder_name)"""
-              # Step 1: Try to get channel from URL pattern
               channel_folder = get_channel_from_url(u)
-              
-              # Step 2: If playlist and no channel found, get from first video
               if not channel_folder and 'playlist' in u:
                   print(f'   🔍 Detecting channel from playlist...')
                   channel_folder = get_channel_from_playlist(u)
-              
-              # Step 3: Last resort
               if not channel_folder:
                   channel_folder = 'playlist_videos'
               
@@ -235,7 +227,7 @@ jobs:
                               'v': fm(vw)
                           })
                       except Exception as e:
-                          print(f'      ⚠️ Skip: {str(e)[:40]}')
+                          print(f'     ⚠️ Skip: {str(e)[:40]}')
                           continue
               
               return v, channel_folder
@@ -343,6 +335,26 @@ jobs:
                   return True
               return False
 
+          # 🆕 NEW: Incremental Git Push Function
+          def push_file(filepath, msg):
+              subprocess.run(['git', 'add', str(filepath)], check=True)
+              # Add split zip parts if they exist
+              for part in Path(filepath).parent.glob(f"{Path(filepath).name}.z*"):
+                  subprocess.run(['git', 'add', str(part)], check=True)
+              
+              subprocess.run(['git', 'commit', '-m', f'📦 {msg} [skip ci]', '--quiet'], check=True)
+              
+              for attempt in range(5):
+                  try:
+                      subprocess.run(['git', 'pull', '--rebase'], capture_output=True, check=True)
+                      subprocess.run(['git', 'push'], capture_output=True, check=True)
+                      print(f'   🚀 Pushed {Path(filepath).name}')
+                      return True
+                  except Exception as e:
+                      time.sleep((attempt + 1) * 5)
+              print(f'   ⚠️ Push failed for {Path(filepath).name} after retries')
+              return False
+
           print(f'{"="*50}')
           print(f'🎬 {M.upper()} MODE')
           print(f'{"="*50}')
@@ -394,6 +406,7 @@ jobs:
                       if size:
                           print(f'   ✅ Downloaded ({size/1e6:.1f}MB)')
                           split_file(fp, SP)
+                          push_file(str(fp), f"v{i:03d}_{x['id']}") # 🆕 Incremental Push
                           ok.append(x['t'])
                       else:
                           print(f'   ❌ Download failed')
@@ -414,12 +427,74 @@ jobs:
               if fl: print(f'❌ Failed: {fl}')
               print(f'{"="*50}')
 
+          elif M == 'multi':
+              print(f'\n🔍 Extracting YouTube URLs from input...')
+              vid_pattern = r'https?://(?:www\.)?(?:youtube\.com/(?:watch\?v=|embed/|v/|shorts/)|youtu\.be/)([\w-]{11})'
+              vids = re.findall(vid_pattern, U)
+
+              if not vids:
+                  print('❌ No YouTube URLs found. Please provide valid YouTube links.')
+                  sys.exit(1)
+
+              print(f'✅ Found {len(vids)} video(s).')
+              cn = 'multi_videos'
+              cd = Path(f'downloads/{cn}')
+              cd.mkdir(parents=True, exist_ok=True)
+
+              v_list = []
+              for i, vid in enumerate(vids):
+                  full_url = f'https://youtube.com/watch?v={vid}'
+                  print(f'   📊 [{i+1}/{len(vids)}] Fetching info...')
+                  ch, vw, dr, handle = gv(vid)
+                  title = f"Video {i+1}"
+                  v_list.append({
+                      'id': vid, 't': title,
+                      'u': full_url, 'dr': int(dr) if dr else 0,
+                      'th': f'https://i.ytimg.com/vi/{vid}/maxresdefault.jpg',
+                      'c': (handle or safe_name(ch, 30)) if ch and ch != 'Unknown' else 'Unknown',
+                      'v': fm(vw)
+                  })
+
+              print(f'\n📝 Creating index...')
+              mkidx(v_list, cn, cd)
+
+              ok, fl = [], []
+              print(f'\n📥 Downloading {len(v_list)} videos...\n{"="*50}')
+              for i, x in enumerate(v_list):
+                  print(f'\n📥 [{i+1}/{len(v_list)}] {x["t"]}')
+                  result = dl_video(x['u'])
+                  if result:
+                      fp = cd / f'v{i+1:03d}_{x["id"]}.{result["e"]}'
+                      size = download_file(result['u'], fp)
+                      if size:
+                          print(f'   ✅ Downloaded ({size/1e6:.1f}MB)')
+                          split_file(fp, SP)
+                          push_file(str(fp), f"v{i+1:03d}_{x['id']}") # 🆕 Incremental Push
+                          ok.append(x['t'])
+                      else:
+                          print(f'   ❌ Download failed')
+                          fl.append(x['t'])
+                  else:
+                      print(f'   ❌ Conversion failed')
+                      fl.append(x['t'])
+                  
+                  if i < len(v_list): 
+                      print(f'   ⏳ Waiting...')
+                      time.sleep(2)
+
+              Path('/tmp/meta.json').write_text(json.dumps({
+                  'm': M, 'cd': str(cd), 'ok': len(ok), 'fl': len(fl), 'total': len(v_list)
+              }))
+              print(f'\n{"="*50}')
+              print(f'📊 {len(ok)}/{len(v_list)} downloaded successfully')
+              if fl: print(f'❌ Failed: {fl}')
+              print(f'{"="*50}')
+
           else:
-              # Single video mode
+              # Single video mode (backward compatible)
               vid_match = re.search(r'(?:v=|/)([\w-]{11})', U)
               vid = vid_match.group(1) if vid_match else 'x'
               
-              # Get channel from the video itself
               ch, _, _, handle = gv(vid)
               cn = handle if handle else get_channel_from_url(U) or safe_name(ch, 30) or 'video'
               
@@ -437,46 +512,27 @@ jobs:
           
           PYEOF
 
-      - name: 📤 Push Files
+      - name: 📤 Final Push & Cleanup
         run: |
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          echo "📤 PUSHING TO GITHUB"
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          
           git config user.name "github-actions[bot]"
           git config user.email "bot@github.com"
           
-          echo ""
-          echo "📋 Adding all files..."
+          # Stage any remaining files (like index markdowns created after downloads)
           git add -A
           
-          TOTAL=$(git diff --cached --name-only | wc -l)
-          echo "   Found $TOTAL files"
-          
-          if [ "$TOTAL" -eq 0 ]; then
-            echo "❌ Nothing to push"
-            exit 0
+          if ! git diff --cached --quiet; then
+            echo "📦 Committing remaining files..."
+            git commit -m "📦 Final commit [skip ci]" --quiet
+            
+            for i in 1 2 3 4 5; do
+              echo -n "   🚀 Attempt $i/5..."
+              if git pull --rebase --quiet 2>/dev/null && git push --quiet 2>/dev/null; then
+                echo " ✅ DONE!"
+                exit 0
+              fi
+              echo " ❌"
+              [ $i -lt 5 ] && sleep $((i*5))
+            done
+          else
+            echo "✅ No remaining files to push."
           fi
-          
-          git diff --cached --name-only | while read f; do
-            echo "   📎 $f"
-          done
-          
-          echo ""
-          echo "📤 Pushing..."
-          
-          git commit -m "📦 $(date +%m%d-%H%M) [skip ci]" --quiet
-          
-          for i in 1 2 3 4 5; do
-            echo -n "   🚀 Attempt $i/5..."
-            if git pull --rebase --quiet 2>/dev/null && git push --quiet 2>/dev/null; then
-              echo " ✅ DONE!"
-              exit 0
-            fi
-            echo " ❌"
-            git rebase --abort 2>/dev/null
-            [ $i -lt 5 ] && sleep $((i*5))
-          done
-          
-          echo "   ❌ Push failed"
-          exit 1
