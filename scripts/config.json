@@ -4,11 +4,23 @@
   "max_retries": 5,
   "retry_backoff_base": 10,
   "archive_state_file": ".archive_state.json",
-  "cache_dirs": {
-    "pip": "~/.cache/pip",
-    "ytdlp": "~/.cache/yt-dlp"
+  "download_engine": "native",
+  "api": {
+    "base_url": "https://hub.ytconvert.org/api/download",
+    "status_poll_interval_sec": 2,
+    "status_max_attempts": 60,
+    "headers": {
+      "User-Agent": "Mozilla/5.0",
+      "Accept": "application/json",
+      "Referer": "https://media.ytmp3.gg/",
+      "Content-Type": "application/json",
+      "Origin": "https://media.ytmp3.gg"
+    }
   },
-  "quality_fallbacks": [2160, 1440, 1080, 720, 480, 360, 144],
+  "quality": {
+    "video_fallbacks": [2160, 1440, 1080, 720, 480, 360, 144],
+    "audio_fallbacks": ["highest", 320, 256, 192, 128]
+  },
   "codec_priority": {
     "h264": ["avc1.*", "h264"],
     "h265": ["hev1.*", "hvc1.*", "hevc"],
@@ -20,6 +32,12 @@
     "mkv": "mkv",
     "webm": "webm"
   },
-  "audio_formats": ["mp3", "m4a"],
-  "default_audio_format": "mp3"
+  "defaults": {
+    "video_quality": "720",
+    "audio_quality": "highest",
+    "video_codec": "h264",
+    "container": "mp4",
+    "frame_rate": "",
+    "download_engine": "native"
+  }
 }
