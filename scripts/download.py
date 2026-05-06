@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Dict, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from utils import safe_name, retry, load_archive, save_archive
+from utils import safe_name, retry, log
 
 def load_config() -> dict:
     """Load config.json, fallback to defaults if missing or invalid."""
@@ -49,14 +49,13 @@ def load_config() -> dict:
         try:
             with open(config_path, 'r') as f:
                 user_config = json.load(f)
-                # shallow merge user overrides into defaults (nested)
                 for key, value in user_config.items():
                     if isinstance(value, dict) and key in defaults:
                         defaults[key].update(value)
                     else:
                         defaults[key] = value
-        except (json.JSONDecodeError, IOError):
-            pass  # fallback to defaults entirely
+        except (json.JSONDecodeError, IOError) as e:
+            log(f"Config load error, using defaults: {e}")
     return defaults
 
 
@@ -79,17 +78,19 @@ def api_download(url: str, media_type: str, quality: str, config: dict) -> Tuple
     headers = config['api']['headers']
     base_url = config['api']['base_url']
 
+    log(f"API request: {url} as {media_type} quality={quality}")
     try:
         resp = requests.post(base_url, json=payload, headers=headers, timeout=15)
         if resp.status_code != 200:
+            log(f"API init failed: status {resp.status_code}")
             return False, None
         data = resp.json()
         status_url = data.get('statusUrl')
         if not status_url:
+            log("API: no statusUrl")
             return False, None
 
-        # Poll for completion
-        for _ in range(config['api']['status_max_attempts']):
+        for attempt in range(config['api']['status_max_attempts']):
             time.sleep(config['api']['status_poll_interval_sec'])
             sr = requests.get(status_url, headers=headers, timeout=10)
             if sr.status_code == 200:
@@ -98,18 +99,19 @@ def api_download(url: str, media_type: str, quality: str, config: dict) -> Tuple
                 if status == 'completed':
                     dl_url = sd.get('downloadUrl')
                     if dl_url:
-                        # Download to a temp file
                         tmp_file = Path(f'/tmp/api_dl_{int(time.time())}.{output_format}')
                         with requests.get(dl_url, stream=True, timeout=600) as r:
                             r.raise_for_status()
                             with open(tmp_file, 'wb') as f:
                                 for chunk in r.iter_content(chunk_size=65536):
                                     f.write(chunk)
+                        log(f"API download successful: {tmp_file}")
                         return True, str(tmp_file)
                 elif status in ('failed', 'error'):
+                    log(f"API status: {status}")
                     break
-    except Exception:
-        pass
+    except Exception as e:
+        log(f"API error: {e}")
     return False, None
 
 
@@ -183,16 +185,18 @@ def native_download(
                 data = json.loads(res.stdout.strip())
                 return True, data
         except Exception as e:
-            print(f'Dry-run metadata error: {e}')
+            log(f"Dry-run metadata error: {e}")
         return False, None
 
-    # Real download with retries
     max_retries = config['max_retries']
     backoff = config['retry_backoff_base']
     for attempt in range(1, max_retries+1):
         try:
+            log(f"yt-dlp attempt {attempt}/{max_retries}: {url}")
             res = subprocess.run(cmd + [url], capture_output=True, text=True, timeout=600)
             if res.returncode != 0:
+                err = res.stderr.strip()[-200:] if res.stderr else ''
+                log(f"yt-dlp returned {res.returncode}: {err}")
                 if attempt < max_retries:
                     time.sleep(backoff * (2 ** (attempt-1)))
                     continue
@@ -250,8 +254,8 @@ def native_download(
                     try:
                         subprocess.run(ffmpeg_cmd, check=True, timeout=120)
                         os.replace(tmp_out, downloaded_file)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        log(f"Thumbnail embed error: {e}")
 
             meta = {
                 'id': info.get('id', ''),
@@ -265,10 +269,11 @@ def native_download(
                 'media_type': media_type,
                 'quality': quality,
             }
+            log(f"Downloaded: {meta['title']} -> {downloaded_file}")
             return True, meta
 
         except Exception as e:
-            print(f'Download attempt {attempt} error: {e}')
+            log(f"Download attempt {attempt} error: {e}")
             time.sleep(backoff * (2 ** (attempt-1)))
     return False, None
 
@@ -289,20 +294,21 @@ def download_media(
 ) -> Tuple[bool, Optional[Dict]]:
     """Unified download dispatcher."""
     if engine == 'api':
-        # For API, we still need metadata from yt-dlp; fetch it via dump-json
+        log(f"API engine selected for {url}")
+        # get metadata for naming
         meta = None
         try:
             info = subprocess.run(
-                ['yt-dlp', '--dump-json', '--no-warnings', url],
+                ['yt-dlp', '--dump-json', '--no-warnings', '--no-check-certificate', url],
                 capture_output=True, text=True, timeout=30
             )
             if info.returncode == 0:
                 meta = json.loads(info.stdout)
-        except Exception:
-            meta = {}
+        except Exception as e:
+            log(f"yt-dlp metadata fetch failed: {e}")
+
         success, tmp_file = api_download(url, media_type, quality, config)
         if success and tmp_file:
-            # Determine final filename using safe metadata
             title = safe_name(meta.get('title', 'video')[:60]) if meta else 'video'
             channel = safe_name(meta.get('channel', 'channel')[:30]) if meta else 'channel'
             date = meta.get('upload_date', '')[:8] if meta else ''
@@ -312,7 +318,6 @@ def download_media(
             final_name = f'{title}_{channel}_{date}_{vid_id}_{quality_suffix}.{ext}'
             dest = output_dir / final_name
             shutil.move(tmp_file, str(dest))
-            # Build metadata dict
             out_meta = {
                 'id': vid_id,
                 'title': meta.get('title', 'Untitled') if meta else 'Untitled',
