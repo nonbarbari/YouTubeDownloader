@@ -3,20 +3,19 @@ import os
 import sys
 import json
 import shutil
-import tempfile
+import glob
+import re
 from pathlib import Path
 from datetime import datetime
 from typing import List, Dict, Optional
-import subprocess
 
-# Add scripts dir to path
 sys.path.insert(0, str(Path(__file__).parent))
 
 from utils import (
     safe_name, extract_youtube_urls, load_archive, save_archive,
-    get_channel_identifier, run_command
+    get_channel_identifier
 )
-from download import download_media, download_batch
+from download import download_media
 from index import generate_markdown_index, generate_metadata_json, generate_playlist_csv
 from report import generate_summary_report
 
@@ -24,15 +23,24 @@ CONFIG_PATH = Path(__file__).parent / 'config.json'
 ARCHIVE_PATH = Path.cwd() / '.archive_state.json'
 
 def load_config() -> dict:
-    with open(CONFIG_PATH) as f:
-        return json.load(f)
+    from download import load_config as dl_load_config
+    return dl_load_config()
 
 def set_env_vars():
-    """Inject env vars from GitHub Actions inputs into os.environ for easy use."""
-    for var in ['MODE', 'URL', 'TYPE', 'QUALITY', 'VIDEO_CODEC', 'CONTAINER', 'FRAME_RATE',
-                'MAX_VIDEOS', 'SPLIT_THRESHOLD_MB', 'DRY_RUN', 'EMBED_THUMBNAIL', 'DOWNLOAD_SUBS']:
-        if var not in os.environ:
-            os.environ[var] = ''
+    """Inject env vars from GitHub Actions inputs into os.environ if not already set."""
+    env_map = {
+        'ACTION': 'ACTION',
+        'MODE': 'MODE', 'URL': 'URL', 'TYPE': 'TYPE',
+        'VIDEO_QUALITY': 'VIDEO_QUALITY', 'AUDIO_QUALITY': 'AUDIO_QUALITY',
+        'VIDEO_CODEC': 'VIDEO_CODEC', 'CONTAINER': 'CONTAINER',
+        'FRAME_RATE': 'FRAME_RATE', 'DOWNLOAD_ENGINE': 'DOWNLOAD_ENGINE',
+        'MAX_VIDEOS': 'MAX_VIDEOS', 'SPLIT_THRESHOLD_MB': 'SPLIT_THRESHOLD_MB',
+        'DRY_RUN': 'DRY_RUN', 'EMBED_THUMBNAIL': 'EMBED_THUMBNAIL',
+        'DOWNLOAD_SUBS': 'DOWNLOAD_SUBS',
+    }
+    for env_key, input_key in env_map.items():
+        if env_key not in os.environ:
+            os.environ[env_key] = ''  # will be populated by actual inputs via workflow env
 
 def parse_mode() -> str:
     return os.environ.get('MODE', 'single')
@@ -42,9 +50,7 @@ def parse_url() -> str:
 
 def parse_int(key: str, default: int) -> int:
     val = os.environ.get(key, '').strip()
-    if val.isdigit():
-        return int(val)
-    return default
+    return int(val) if val.isdigit() else default
 
 def parse_bool(key: str, default: bool) -> bool:
     val = os.environ.get(key, '').strip().lower()
@@ -62,31 +68,24 @@ def get_run_base_dir(mode: str, identifier: Optional[str] = None) -> Path:
     elif mode == 'batch':
         return downloads / 'batch' / timestamp
     elif mode == 'playlist':
-        return downloads / 'playlist' / safe_name(identifier, 40) if identifier else downloads / 'playlist'
+        return downloads / 'playlist' / (safe_name(identifier, 40) if identifier else 'playlist')
     elif mode == 'channel':
-        return downloads / 'channel' / safe_name(identifier, 40) if identifier else downloads / 'channel'
+        return downloads / 'channel' / (safe_name(identifier, 40) if identifier else 'channel')
     else:
         return downloads / 'other' / timestamp
 
 def get_video_list(mode: str, url: str, max_videos: int, archive: Dict) -> List[Dict]:
-    """Return list of video dicts with 'id', 'url', maybe metadata."""
+    """Return list of video dicts with 'id', 'url', maybe 'title'."""
     if mode == 'batch':
-        # Extract URLs, deduplicate, filter by archive
         urls = extract_youtube_urls(url)
-        urls = list(dict.fromkeys(urls))  # preserve order, remove duplicates
         videos = []
         for u in urls:
-            vid_id = None
-            # Extract video ID from URL
             m = re.search(r'(?:v=|/)([\w-]{11})', u)
-            if m:
-                vid_id = m.group(1)
-            if vid_id and vid_id in archive:
-                continue
-            videos.append({'id': vid_id, 'url': u})
+            vid_id = m.group(1) if m else None
+            if vid_id and vid_id not in archive:
+                videos.append({'id': vid_id, 'url': u})
         return videos
     elif mode in ('playlist', 'channel'):
-        # Use yt-dlp flat playlist extraction
         cmd = ['yt-dlp', '--flat-playlist', '--dump-json', '--no-warnings', '--no-check-certificate']
         if max_videos > 0:
             cmd.extend(['--playlist-end', str(max_videos)])
@@ -99,27 +98,22 @@ def get_video_list(mode: str, url: str, max_videos: int, archive: Dict) -> List[
             try:
                 data = json.loads(line)
                 vid = data.get('id')
-                if not vid or vid in archive:
-                    continue
-                videos.append({
-                    'id': vid,
-                    'url': f'https://youtube.com/watch?v={vid}',
-                    'title': data.get('title', 'Untitled')[:100]
-                })
+                if vid and vid not in archive:
+                    videos.append({
+                        'id': vid,
+                        'url': f'https://youtube.com/watch?v={vid}',
+                        'title': data.get('title', 'Untitled')[:100]
+                    })
             except:
                 continue
         return videos
     elif mode == 'single':
-        # Single video
-        vid = None
         m = re.search(r'(?:v=|/)([\w-]{11})', url)
-        if m:
-            vid = m.group(1)
+        vid = m.group(1) if m else None
         if vid and vid in archive:
             return []
         return [{'id': vid, 'url': url}]
     elif mode == 'search':
-        # Search mode doesn't download, only index
         return []  # handled separately
     return []
 
@@ -131,41 +125,41 @@ def do_downloads(
     dry_run: bool,
     archive: Dict
 ) -> (List[Dict], List[Dict], int):
-    """Perform downloads, return (success_entries, failures, total_size). Update archive."""
+    """Download videos, return (success_entries, failures, total_size)."""
     all_success = []
     all_failures = []
     total_size = 0
-    # Process in batches with ThreadPoolExecutor
     if not videos:
         return [], [], 0
 
-    output_dir = base_dir
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    success_entries = []
+    base_dir.mkdir(parents=True, exist_ok=True)
     for vid in videos:
-        vid_id = vid.get('id')
         success, meta = download_media(
             vid['url'],
-            output_dir,
+            base_dir,
             options['type'],
             options['quality'],
-            options.get('video_codec', 'h264'),
-            options.get('container', 'mp4'),
-            options.get('frame_rate', ''),
-            options.get('embed_thumbnail', False),
-            options.get('download_subs', True),
-            dry_run,
+            config,
+            engine=options.get('engine', 'native'),
+            video_codec=options.get('video_codec', 'h264'),
+            container=options.get('container', 'mp4'),
+            frame_rate=options.get('frame_rate', ''),
+            embed_thumbnail=options.get('embed_thumbnail', False),
+            download_subs=options.get('download_subs', True),
+            dry_run=dry_run,
         )
         if success:
-            # Update archive immediately
-            archive[vid_id] = datetime.now().isoformat()
-            success_entries.append({'video': vid, 'meta': meta})
+            archive[vid['id']] = datetime.now().isoformat()
+            all_success.append({'video': vid, 'meta': meta})
             if meta and 'filepath' in meta and os.path.exists(meta['filepath']):
                 total_size += os.path.getsize(meta['filepath'])
         else:
-            all_failures.append({'url': vid['url'], 'title': vid.get('title', 'Unknown'), 'error': 'Download failed'})
-    return success_entries, all_failures, total_size
+            all_failures.append({
+                'url': vid['url'],
+                'title': vid.get('title', 'Unknown'),
+                'error': 'Download failed'
+            })
+    return all_success, all_failures, total_size
 
 def run_process_basic():
     """Handle single, search, batch modes directly."""
@@ -178,7 +172,6 @@ def run_process_basic():
     archive = load_archive(ARCHIVE_PATH)
 
     if mode == 'search':
-        # Search: generate markdown only, no downloads
         output_dir = Path('searches')
         output_dir.mkdir(parents=True, exist_ok=True)
         cmd = ['yt-dlp', f'ytsearch{max_videos}:{url}', '--dump-json', '--no-warnings']
@@ -204,10 +197,8 @@ def run_process_basic():
             f'🔍 Search: {url}',
             'search'
         )
-        # No push here, push step will handle
         return
 
-    # For other modes: download
     videos = get_video_list(mode, url, max_videos, archive)
     if not videos:
         print('No videos to download (all already archived or invalid).')
@@ -224,12 +215,14 @@ def run_process_basic():
         identifier = get_channel_identifier(url) or 'channel'
     base_dir = get_run_base_dir(mode, identifier)
 
+    quality = os.environ.get('VIDEO_QUALITY', '720') if os.environ.get('TYPE') == 'video' else os.environ.get('AUDIO_QUALITY', 'highest')
     options = {
         'type': os.environ.get('TYPE', 'video'),
-        'quality': os.environ.get('QUALITY', '720'),
+        'quality': quality,
         'video_codec': os.environ.get('VIDEO_CODEC', 'h264'),
         'container': os.environ.get('CONTAINER', 'mp4'),
         'frame_rate': os.environ.get('FRAME_RATE', ''),
+        'engine': os.environ.get('DOWNLOAD_ENGINE', config['defaults']['download_engine']),
         'embed_thumbnail': parse_bool('EMBED_THUMBNAIL', False),
         'download_subs': parse_bool('DOWNLOAD_SUBS', True),
         'dry_run': dry_run,
@@ -237,7 +230,6 @@ def run_process_basic():
 
     success, failures, total_size = do_downloads(videos, base_dir, config, options, dry_run, archive)
 
-    # Generate indices
     all_entries = []
     for s in success:
         meta = s['meta']
@@ -263,7 +255,6 @@ def run_process_basic():
     generate_metadata_json(all_entries, idx_dir / 'metadata.json')
     generate_playlist_csv(all_entries, idx_dir / 'playlist.csv')
 
-    # Summary report
     generate_summary_report(
         idx_dir / 'summary.md',
         datetime.now().isoformat(),
@@ -273,25 +264,14 @@ def run_process_basic():
         len(failures),
         total_size,
         failures,
-        [],  # skipped duplicates already filtered
+        [],
         dry_run,
     )
 
-    # Save archive
     save_archive(ARCHIVE_PATH, archive)
 
-    # Cleanup temp files
-    import atexit, shutil
-    def cleanup():
-        try:
-            shutil.rmtree('/tmp/ytdlp_*', ignore_errors=True)
-        except:
-            pass
-    atexit.register(cleanup)
-
-# ─── Playlist / Channel matrix handling ─────────────────────
+# ─── Playlist / Channel matrix handling (unchanged from previous) ──
 def preflight():
-    """Extract video IDs for playlist/channel, output chunk info."""
     config = load_config()
     set_env_vars()
     url = parse_url()
@@ -299,11 +279,9 @@ def preflight():
     archive = load_archive(ARCHIVE_PATH)
     videos = get_video_list(parse_mode(), url, max_videos, archive)
 
-    # Save video list to artifact
     with open('/tmp/video_list.json', 'w') as f:
         json.dump(videos, f)
 
-    # Determine chunking
     chunk_size = 20
     total = len(videos)
     if total <= chunk_size:
@@ -312,13 +290,11 @@ def preflight():
         num_chunks = (total + chunk_size - 1) // chunk_size
         chunk_indices = list(range(num_chunks))
 
-    # Write outputs for GitHub Actions
     with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
         f.write(f'chunk_count={len(chunk_indices)}\n')
         f.write(f'chunk_indices={json.dumps(chunk_indices)}\n')
 
 def download_chunk(chunk_index_str: str):
-    """Download a single chunk given its index (from matrix)."""
     chunk_index = int(chunk_index_str)
     config = load_config()
     set_env_vars()
@@ -336,12 +312,14 @@ def download_chunk(chunk_index_str: str):
     base_dir = Path('/tmp/chunk_output')
     base_dir.mkdir(parents=True, exist_ok=True)
 
+    quality = os.environ.get('VIDEO_QUALITY', '720') if os.environ.get('TYPE') == 'video' else os.environ.get('AUDIO_QUALITY', 'highest')
     options = {
         'type': os.environ.get('TYPE', 'video'),
-        'quality': os.environ.get('QUALITY', '720'),
+        'quality': quality,
         'video_codec': os.environ.get('VIDEO_CODEC', 'h264'),
         'container': os.environ.get('CONTAINER', 'mp4'),
         'frame_rate': os.environ.get('FRAME_RATE', ''),
+        'engine': os.environ.get('DOWNLOAD_ENGINE', config['defaults']['download_engine']),
         'embed_thumbnail': parse_bool('EMBED_THUMBNAIL', False),
         'download_subs': parse_bool('DOWNLOAD_SUBS', True),
         'dry_run': dry_run,
@@ -349,7 +327,6 @@ def download_chunk(chunk_index_str: str):
 
     success, failures, _ = do_downloads(chunk, base_dir, config, options, dry_run, archive)
 
-    # Save chunk metadata
     chunk_meta = {
         'chunk': chunk_index,
         'success': [s['meta'] for s in success],
@@ -359,43 +336,21 @@ def download_chunk(chunk_index_str: str):
     with open(base_dir / 'chunk_meta.json', 'w') as f:
         json.dump(chunk_meta, f, indent=2)
 
-    # Update archive after chunk (will be merged later)
-    # Actually archive updates should be atomic, so we write a local archive delta.
-    archive_delta = {}
-    for s in success:
-        vid = s['video']['id']
-        archive_delta[vid] = datetime.now().isoformat()
+    archive_delta = {s['video']['id']: datetime.now().isoformat() for s in success}
     with open(base_dir / 'archive_delta.json', 'w') as f:
         json.dump(archive_delta, f)
 
 def assemble():
-    """Merge all chunk outputs and push."""
-    import glob
     config = load_config()
     set_env_vars()
     archive = load_archive(ARCHIVE_PATH)
 
-    # Collect all chunk dirs
     chunk_dirs = glob.glob('/tmp/all_chunks/chunk-*')
     all_meta = []
     all_failures = []
     total_size = 0
-    base_final = None
-
-    for cdir in chunk_dirs:
-        meta_file = Path(cdir) / 'chunk_meta.json'
-        if meta_file.exists():
-            with open(meta_file) as f:
-                chunk_data = json.load(f)
-                all_meta.extend(chunk_data.get('success', []))
-                all_failures.extend(chunk_data.get('failures', []))
-        # Move actual media files to final location
-        for item in Path(cdir).iterdir():
-            if item.is_file() and item.suffix not in ('.json',):
-                pass  # Files already in chunk dirs, we need to merge into final dir. For simplicity, we'll just copy everything to downloads/playlist or channel based on mode.
-    # Determine target base dir
-    mode = os.environ['MODE']
-    url = os.environ['URL']
+    mode = parse_mode()
+    url = parse_url()
     identifier = None
     if mode == 'playlist':
         identifier = safe_name(url.split('list=')[-1] if 'list=' in url else 'playlist', 40)
@@ -404,26 +359,30 @@ def assemble():
     base_target = get_run_base_dir(mode, identifier)
     base_target.mkdir(parents=True, exist_ok=True)
 
-    # Move all files from chunk dirs to target
     for cdir in chunk_dirs:
-        for file in Path(cdir).iterdir():
-            if file.is_file() and file.suffix not in ('.json',):
-                shutil.move(str(file), str(base_target / file.name))
-            elif file.is_dir():
-                dest_sub = base_target / file.name
+        meta_file = Path(cdir) / 'chunk_meta.json'
+        if meta_file.exists():
+            with open(meta_file) as f:
+                chunk_data = json.load(f)
+                all_meta.extend(chunk_data.get('success', []))
+                all_failures.extend(chunk_data.get('failures', []))
+
+        # Move media files
+        for item in Path(cdir).iterdir():
+            if item.is_file() and item.suffix not in ('.json',):
+                shutil.move(str(item), str(base_target / item.name))
+            elif item.is_dir():
+                dest_sub = base_target / item.name
                 dest_sub.mkdir(exist_ok=True)
-                for subfile in file.iterdir():
+                for subfile in item.iterdir():
                     shutil.move(str(subfile), str(dest_sub / subfile.name))
 
-    # Update global archive with all deltas
-    for cdir in chunk_dirs:
+        # Update archive
         delta_file = Path(cdir) / 'archive_delta.json'
         if delta_file.exists():
             with open(delta_file) as f:
-                delta = json.load(f)
-                archive.update(delta)
+                archive.update(json.load(f))
 
-    # Build final index entries
     all_entries = []
     for idx, meta in enumerate(all_meta, 1):
         all_entries.append({
