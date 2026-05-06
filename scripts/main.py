@@ -5,6 +5,7 @@ import json
 import shutil
 import glob
 import re
+import subprocess
 from pathlib import Path
 from datetime import datetime
 from typing import List, Dict, Optional
@@ -13,9 +14,9 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from utils import (
     safe_name, extract_youtube_urls, load_archive, save_archive,
-    get_channel_identifier
+    get_channel_identifier, set_log_file, log
 )
-from download import download_media
+from download import download_media, load_config as dl_load_config
 from index import generate_markdown_index, generate_metadata_json, generate_playlist_csv
 from report import generate_summary_report
 
@@ -23,11 +24,9 @@ CONFIG_PATH = Path(__file__).parent / 'config.json'
 ARCHIVE_PATH = Path.cwd() / '.archive_state.json'
 
 def load_config() -> dict:
-    from download import load_config as dl_load_config
     return dl_load_config()
 
 def set_env_vars():
-    """Inject env vars from GitHub Actions inputs into os.environ if not already set."""
     env_map = {
         'ACTION': 'ACTION',
         'MODE': 'MODE', 'URL': 'URL', 'TYPE': 'TYPE',
@@ -40,7 +39,7 @@ def set_env_vars():
     }
     for env_key, input_key in env_map.items():
         if env_key not in os.environ:
-            os.environ[env_key] = ''  # will be populated by actual inputs via workflow env
+            os.environ[env_key] = ''
 
 def parse_mode() -> str:
     return os.environ.get('MODE', 'single')
@@ -75,7 +74,6 @@ def get_run_base_dir(mode: str, identifier: Optional[str] = None) -> Path:
         return downloads / 'other' / timestamp
 
 def get_video_list(mode: str, url: str, max_videos: int, archive: Dict) -> List[Dict]:
-    """Return list of video dicts with 'id', 'url', maybe 'title'."""
     if mode == 'batch':
         urls = extract_youtube_urls(url)
         videos = []
@@ -84,37 +82,44 @@ def get_video_list(mode: str, url: str, max_videos: int, archive: Dict) -> List[
             vid_id = m.group(1) if m else None
             if vid_id and vid_id not in archive:
                 videos.append({'id': vid_id, 'url': u})
+        log(f"Batch: {len(urls)} URLs extracted, {len(videos)} new after archive filter")
         return videos
     elif mode in ('playlist', 'channel'):
         cmd = ['yt-dlp', '--flat-playlist', '--dump-json', '--no-warnings', '--no-check-certificate']
         if max_videos > 0:
             cmd.extend(['--playlist-end', str(max_videos)])
         cmd.append(url)
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-        videos = []
-        for line in result.stdout.strip().split('\n'):
-            if not line:
-                continue
-            try:
-                data = json.loads(line)
-                vid = data.get('id')
-                if vid and vid not in archive:
-                    videos.append({
-                        'id': vid,
-                        'url': f'https://youtube.com/watch?v={vid}',
-                        'title': data.get('title', 'Untitled')[:100]
-                    })
-            except:
-                continue
-        return videos
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+            videos = []
+            for line in result.stdout.strip().split('\n'):
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                    vid = data.get('id')
+                    if vid and vid not in archive:
+                        videos.append({
+                            'id': vid,
+                            'url': f'https://youtube.com/watch?v={vid}',
+                            'title': data.get('title', 'Untitled')[:100]
+                        })
+                except:
+                    continue
+            log(f"Playlist: {len(videos)} new videos (max={max_videos})")
+            return videos
+        except Exception as e:
+            log(f"yt-dlp playlist error: {e}")
+            return []
     elif mode == 'single':
         m = re.search(r'(?:v=|/)([\w-]{11})', url)
         vid = m.group(1) if m else None
         if vid and vid in archive:
+            log(f"Single video {vid} already archived, skipping")
             return []
         return [{'id': vid, 'url': url}]
     elif mode == 'search':
-        return []  # handled separately
+        return []
     return []
 
 def do_downloads(
@@ -125,15 +130,16 @@ def do_downloads(
     dry_run: bool,
     archive: Dict
 ) -> (List[Dict], List[Dict], int):
-    """Download videos, return (success_entries, failures, total_size)."""
     all_success = []
     all_failures = []
     total_size = 0
     if not videos:
+        log("No videos to download.")
         return [], [], 0
 
     base_dir.mkdir(parents=True, exist_ok=True)
     for vid in videos:
+        log(f"Processing: {vid['id']} {vid.get('title','')}")
         success, meta = download_media(
             vid['url'],
             base_dir,
@@ -152,8 +158,13 @@ def do_downloads(
             archive[vid['id']] = datetime.now().isoformat()
             all_success.append({'video': vid, 'meta': meta})
             if meta and 'filepath' in meta and os.path.exists(meta['filepath']):
-                total_size += os.path.getsize(meta['filepath'])
+                size = os.path.getsize(meta['filepath'])
+                total_size += size
+                log(f"  -> OK ({size/1024/1024:.1f} MB)")
+            else:
+                log("  -> OK but file missing")
         else:
+            log(f"  -> FAILED")
             all_failures.append({
                 'url': vid['url'],
                 'title': vid.get('title', 'Unknown'),
@@ -162,9 +173,12 @@ def do_downloads(
     return all_success, all_failures, total_size
 
 def run_process_basic():
-    """Handle single, search, batch modes directly."""
     config = load_config()
     set_env_vars()
+    # Init logging
+    log_path = Path(os.environ.get('LOG_FILE', 'workflow_run.log'))
+    set_log_file(log_path)
+    log("Download session started")
     mode = parse_mode()
     url = parse_url()
     max_videos = parse_int('MAX_VIDEOS', 10)
@@ -197,11 +211,12 @@ def run_process_basic():
             f'🔍 Search: {url}',
             'search'
         )
+        log(f"Search index saved: {idx_file}")
         return
 
     videos = get_video_list(mode, url, max_videos, archive)
     if not videos:
-        print('No videos to download (all already archived or invalid).')
+        log("No new videos to process (all archived or invalid).")
         return
 
     identifier = None
@@ -269,16 +284,20 @@ def run_process_basic():
     )
 
     save_archive(ARCHIVE_PATH, archive)
+    log("Download session finished")
 
-# ─── Playlist / Channel matrix handling (unchanged from previous) ──
+# ─── Playlist/Channel matrix handlers (unchanged except logging) ──
 def preflight():
     config = load_config()
     set_env_vars()
+    log_path = Path(os.environ.get('LOG_FILE', 'workflow_run.log'))
+    set_log_file(log_path)
+    log("Preflight started")
     url = parse_url()
     max_videos = parse_int('MAX_VIDEOS', 10)
     archive = load_archive(ARCHIVE_PATH)
     videos = get_video_list(parse_mode(), url, max_videos, archive)
-
+    log(f"Total videos for chunking: {len(videos)}")
     with open('/tmp/video_list.json', 'w') as f:
         json.dump(videos, f)
 
@@ -289,6 +308,7 @@ def preflight():
     else:
         num_chunks = (total + chunk_size - 1) // chunk_size
         chunk_indices = list(range(num_chunks))
+    log(f"Chunk indices: {chunk_indices}")
 
     with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
         f.write(f'chunk_count={len(chunk_indices)}\n')
@@ -298,6 +318,9 @@ def download_chunk(chunk_index_str: str):
     chunk_index = int(chunk_index_str)
     config = load_config()
     set_env_vars()
+    log_path = Path('/tmp/chunk_output') / f'chunk_{chunk_index}.log'
+    set_log_file(log_path)
+    log(f"Chunk {chunk_index} started")
     dry_run = parse_bool('DRY_RUN', False)
     archive = load_archive(ARCHIVE_PATH)
 
@@ -308,6 +331,7 @@ def download_chunk(chunk_index_str: str):
     start = chunk_index * chunk_size
     end = start + chunk_size
     chunk = all_videos[start:end]
+    log(f"Videos in chunk: {len(chunk)}")
 
     base_dir = Path('/tmp/chunk_output')
     base_dir.mkdir(parents=True, exist_ok=True)
@@ -339,13 +363,18 @@ def download_chunk(chunk_index_str: str):
     archive_delta = {s['video']['id']: datetime.now().isoformat() for s in success}
     with open(base_dir / 'archive_delta.json', 'w') as f:
         json.dump(archive_delta, f)
+    log(f"Chunk {chunk_index} finished: {len(success)} ok, {len(failures)} failed")
 
 def assemble():
     config = load_config()
     set_env_vars()
+    log_path = Path(os.environ.get('LOG_FILE', 'workflow_run.log'))
+    set_log_file(log_path)
+    log("Assemble started")
     archive = load_archive(ARCHIVE_PATH)
 
     chunk_dirs = glob.glob('/tmp/all_chunks/chunk-*')
+    log(f"Found {len(chunk_dirs)} chunk dirs")
     all_meta = []
     all_failures = []
     total_size = 0
@@ -417,9 +446,9 @@ def assemble():
     )
 
     save_archive(ARCHIVE_PATH, archive)
+    log("Assemble finished")
 
 if __name__ == '__main__':
-    import sys
     if len(sys.argv) > 1 and sys.argv[1] == '--preflight':
         preflight()
     elif len(sys.argv) > 2 and sys.argv[1] == '--download-chunk':
