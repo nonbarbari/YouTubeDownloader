@@ -25,7 +25,7 @@ on:
           - batch
         default: 'single'
       url:
-        description: '🎬 URL / Search Query / Channel name (@ChannelName or ChannelName) / Multi-line URLs (batch)'
+        description: '🎬 URL / Search / Channel / Multi‑line (batch)'
         required: false
         type: string
       type:
@@ -81,7 +81,7 @@ on:
           - webm
         default: 'mp4'
       frame_rate:
-        description: '🎥 Frame Rate (leave blank for original)'
+        description: '🎥 Frame Rate (blank = original)'
         required: false
         type: string
         default: ''
@@ -109,16 +109,16 @@ on:
         type: boolean
         default: false
       embed_thumbnail:
-        description: '🖼️ Embed thumbnail into video (video mode)'
+        description: '🖼️ Embed thumbnail'
         required: false
         type: boolean
         default: false
       download_subtitles:
-        description: '💬 Download Persian/English subtitles'
+        description: '💬 Download fa/en subs'
         required: false
         type: boolean
         default: true
-      # ─── Clean inputs ────────────────────────────────
+      # ─── Clean input ─────────────────────────────────
       confirm_delete:
         description: '⚠️ Type "I CONFIRM" to delete all downloads'
         required: false
@@ -128,11 +128,12 @@ on:
 env:
   PYTHONUNBUFFERED: '1'
   DEBIAN_FRONTEND: 'noninteractive'
+  LOG_FILE: 'workflow_run.log'
 
 jobs:
-  # ─── Clean job ──────────────────────────────────────
+  # ─── Clean job – no artifacts, direct delete ─────────
   clean-downloads:
-    if: github.event.inputs.action == 'clean' && github.event.inputs.confirm_delete == 'I CONFIRM'
+    if: ${{ github.event.inputs.action == 'clean' && github.event.inputs.confirm_delete == 'I CONFIRM' }}
     name: 🧹 Clean downloads
     runs-on: ubuntu-latest
     permissions:
@@ -145,35 +146,39 @@ jobs:
 
       - name: 🗑️ Delete downloads folder
         run: |
+          echo "[$(date -Is)] Clean action triggered" >> $LOG_FILE
           if [ -d "downloads" ]; then
             rm -rf downloads
-            echo "downloads/ folder deleted."
+            echo "downloads/ folder deleted." | tee -a $LOG_FILE
           else
-            echo "downloads/ folder does not exist, nothing to do."
+            echo "downloads/ does not exist." | tee -a $LOG_FILE
           fi
 
-      - name: 📤 Commit & Push
+      - name: 📤 Commit & Push (always)
+        if: always()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "bot@github.com"
           git add -A
           if git diff --cached --quiet; then
-            echo "No changes to commit."
+            echo "No changes to commit." | tee -a $LOG_FILE
             exit 0
           fi
-          git commit -m "🧹 Clean downloads $(date +%m%d-%H%M)"
+          git commit -m "🧹 Clean downloads $(date +%m%d-%H%M)" | tee -a $LOG_FILE
           for i in 1 2 3 4 5; do
-            if git pull --rebase --quiet && git push --quiet; then
-              echo "Push successful."
+            echo "Push attempt $i..." | tee -a $LOG_FILE
+            if git pull --rebase --quiet 2>&1 | tee -a $LOG_FILE && git push --quiet 2>&1 | tee -a $LOG_FILE; then
+              echo "Push OK." | tee -a $LOG_FILE
               exit 0
             fi
             sleep $((i*5))
           done
-          echo "Push failed."; exit 1
+          echo "Push failed." | tee -a $LOG_FILE
+          exit 1
 
-  # ─── Download jobs ──────────────────────────────────
-  process-basic:
-    if: github.event.inputs.action == 'download' && (github.event.inputs.mode == 'single' || github.event.inputs.mode == 'search' || github.event.inputs.mode == 'batch')
+  # ─── Download jobs – direct push for simple modes ────
+  download-simple:
+    if: ${{ github.event.inputs.action == 'download' && (github.event.inputs.mode == 'single' || github.event.inputs.mode == 'search' || github.event.inputs.mode == 'batch') }}
     name: 🚀 ${{ github.event.inputs.mode }} mode
     runs-on: ${{ github.event.inputs.runner || 'ubuntu-latest' }}
     timeout-minutes: 240
@@ -201,55 +206,68 @@ jobs:
           path: ~/.cache/uv
           key: uv-${{ runner.os }}-${{ hashFiles('scripts/requirements.txt') }}
 
-      - name: ⚡ Install Python deps with uv
-        run: |
-          python3 -m pip install uv
-          uv pip install --system -r scripts/requirements.txt || pip install -r scripts/requirements.txt
-
-      - name: 🎯 Run
-        run: python3 scripts/main.py
-
-      - name: 📤 Commit & Push
-        run: bash scripts/push.sh
-
-  # ─── Playlist/Channel with matrix ───────────────────
-  prep-playlist:
-    if: github.event.inputs.action == 'download' && (github.event.inputs.mode == 'playlist' || github.event.inputs.mode == 'channel')
-    name: 📋 Prepare playlist/channel
-    runs-on: ${{ github.event.inputs.runner || 'ubuntu-latest' }}
-    outputs:
-      chunk_count: ${{ steps.preflight.outputs.chunk_count }}
-      chunk_indices: ${{ steps.preflight.outputs.chunk_indices }}
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          fetch-depth: 0
-
-      - name: 🧰 System dependencies
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq aria2
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - uses: actions/cache@v4
-        with:
-          path: ~/.cache/uv
-          key: uv-${{ runner.os }}-${{ hashFiles('scripts/requirements.txt') }}
-
       - name: ⚡ Install Python deps
         run: |
           python3 -m pip install uv
           uv pip install --system -r scripts/requirements.txt || pip install -r scripts/requirements.txt
 
-      - name: 🔍 Extract video IDs & chunk
+      - name: 🎯 Run download (logging)
+        id: run
+        run: |
+          echo "" > $LOG_FILE
+          python3 scripts/main.py 2>&1 | tee -a $LOG_FILE
+        # continue even if script fails, so we commit the log
+        continue-on-error: true
+
+      - name: 📤 Commit & Push always (including log)
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "bot@github.com"
+          git add -A
+          # force-add log file even if .gitignore might skip it
+          git add -f $LOG_FILE
+          if git diff --cached --quiet; then
+            echo "No changes to commit." | tee -a $LOG_FILE
+            exit 0
+          fi
+          git commit -m "📥 ${{ github.event.inputs.mode }} $(date +%m%d-%H%M)" | tee -a $LOG_FILE
+          for i in 1 2 3 4 5; do
+            echo "Push attempt $i..." | tee -a $LOG_FILE
+            if git pull --rebase --quiet 2>&1 | tee -a $LOG_FILE && git push --quiet 2>&1 | tee -a $LOG_FILE; then
+              echo "Push OK." | tee -a $LOG_FILE
+              exit 0
+            fi
+            sleep $((i*5))
+          done
+          echo "Push failed." | tee -a $LOG_FILE
+          exit 1
+
+  # ─── Playlist/Channel with matrix (artifacts only for chunking) ──
+  prep-playlist:
+    if: ${{ github.event.inputs.action == 'download' && (github.event.inputs.mode == 'playlist' || github.event.inputs.mode == 'channel') }}
+    name: 📋 Prepare list
+    runs-on: ${{ github.event.inputs.runner || 'ubuntu-latest' }}
+    outputs:
+      chunk_count: ${{ steps.preflight.outputs.chunk_count }}
+      chunk_indices: ${{ steps.preflight.outputs.chunk_indices }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/uv
+          key: uv-${{ runner.os }}-${{ hashFiles('scripts/requirements.txt') }}
+      - run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq aria2
+          python3 -m pip install uv
+          uv pip install --system -r scripts/requirements.txt || pip install -r scripts/requirements.txt
+      - name: Extract IDs & chunk
         id: preflight
         run: python3 scripts/main.py --preflight
-
-      - name: 📤 Upload video list artifact
+      - name: Upload video list artifact
         uses: actions/upload-artifact@v4
         with:
           name: video-list
@@ -258,6 +276,7 @@ jobs:
 
   download-chunks:
     needs: prep-playlist
+    if: ${{ needs.prep-playlist.outputs.chunk_count > 0 }}
     name: 🧩 Chunk ${{ matrix.chunk }}
     runs-on: ${{ github.event.inputs.runner || 'ubuntu-latest' }}
     strategy:
@@ -268,37 +287,25 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          fetch-depth: 0
-
-      - name: 🧰 System dependencies
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq aria2 p7zip-full ffmpeg
-
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
       - uses: actions/cache@v4
         with:
           path: ~/.cache/uv
           key: uv-${{ runner.os }}-${{ hashFiles('scripts/requirements.txt') }}
-
-      - name: ⚡ Install Python deps
-        run: |
+      - run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq aria2 p7zip-full ffmpeg
           python3 -m pip install uv
           uv pip install --system -r scripts/requirements.txt || pip install -r scripts/requirements.txt
-
-      - name: 📥 Download artifact (video list)
+      - name: Download artifact (video list)
         uses: actions/download-artifact@v4
         with:
           name: video-list
           path: /tmp
-
-      - name: 📦 Download chunk
+      - name: Download chunk
         run: python3 scripts/main.py --download-chunk ${{ matrix.chunk }}
-
-      - name: 📤 Upload chunk artifact
+      - name: Upload chunk artifact
         uses: actions/upload-artifact@v4
         with:
           name: chunk-${{ matrix.chunk }}
@@ -307,7 +314,7 @@ jobs:
 
   assemble:
     needs: download-chunks
-    if: ${{ always() && needs.download-chunks.result != 'failure' }}
+    if: ${{ always() && needs.download-chunks.result != 'failure' && needs.download-chunks.result != 'cancelled' }}
     name: 🧩 Assemble & Push
     runs-on: ${{ github.event.inputs.runner || 'ubuntu-latest' }}
     permissions:
@@ -317,33 +324,52 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           fetch-depth: 0
-
-      - name: 🧰 System dependencies
-        run: sudo apt-get install -y -qq p7zip-full
-
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
-      - name: ⚡ Install Python deps
-        run: |
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/uv
+          key: uv-${{ runner.os }}-${{ hashFiles('scripts/requirements.txt') }}
+      - run: |
+          sudo apt-get install -y -qq p7zip-full
           python3 -m pip install uv
           uv pip install --system -r scripts/requirements.txt || pip install -r scripts/requirements.txt
-
-      - name: 📥 Download all chunk artifacts
+      - name: Download chunk artifacts
         uses: actions/download-artifact@v4
         with:
           path: /tmp/all_chunks
           pattern: chunk-*
-
-      - name: 📥 Download video list artifact
+      - name: Download video list artifact
         uses: actions/download-artifact@v4
         with:
           name: video-list
           path: /tmp
-
-      - name: 🧩 Merge chunks & generate final index
-        run: python3 scripts/main.py --assemble
-
-      - name: 📤 Commit & Push
-        run: bash scripts/push.sh
+      - name: Merge & index
+        id: run
+        run: |
+          echo "" > $LOG_FILE
+          python3 scripts/main.py --assemble 2>&1 | tee -a $LOG_FILE
+        continue-on-error: true
+      - name: 📤 Commit & Push always (including log)
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "bot@github.com"
+          git add -A
+          git add -f $LOG_FILE
+          if git diff --cached --quiet; then
+            echo "No changes to commit." | tee -a $LOG_FILE
+            exit 0
+          fi
+          git commit -m "📥 ${{ github.event.inputs.mode }} $(date +%m%d-%H%M)" | tee -a $LOG_FILE
+          for i in 1 2 3 4 5; do
+            echo "Push attempt $i..." | tee -a $LOG_FILE
+            if git pull --rebase --quiet 2>&1 | tee -a $LOG_FILE && git push --quiet 2>&1 | tee -a $LOG_FILE; then
+              echo "Push OK." | tee -a $LOG_FILE
+              exit 0
+            fi
+            sleep $((i*5))
+          done
+          echo "Push failed." | tee -a $LOG_FILE
+          exit 1
