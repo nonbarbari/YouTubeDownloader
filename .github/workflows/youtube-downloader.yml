@@ -1,0 +1,349 @@
+# .github/workflows/youtube-downloader.yml
+name: 🎯 YouTube Downloader & Cleaner
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Action to perform'
+        required: true
+        type: choice
+        options:
+          - download
+          - clean
+        default: 'download'
+      # ─── Download inputs ─────────────────────────────
+      mode:
+        description: '🔄 Download Mode'
+        required: false
+        type: choice
+        options:
+          - single
+          - playlist
+          - channel
+          - search
+          - batch
+        default: 'single'
+      url:
+        description: '🎬 URL / Search Query / Channel name (@ChannelName or ChannelName) / Multi-line URLs (batch)'
+        required: false
+        type: string
+      type:
+        description: '📦 Output Type'
+        required: false
+        type: choice
+        options:
+          - video
+          - audio
+        default: 'video'
+      video_quality:
+        description: '📹 Video Quality'
+        required: false
+        type: choice
+        options:
+          - highest
+          - '2160'
+          - '1440'
+          - '1080'
+          - '720'
+          - '480'
+          - '360'
+          - '144'
+        default: '720'
+      audio_quality:
+        description: '🎵 Audio Quality (kbps)'
+        required: false
+        type: choice
+        options:
+          - highest
+          - '320'
+          - '256'
+          - '192'
+          - '128'
+        default: 'highest'
+      video_codec:
+        description: '🎞 Video Codec'
+        required: false
+        type: choice
+        options:
+          - h264
+          - h265
+          - av1
+          - vp9
+        default: 'h264'
+      container:
+        description: '📁 Container'
+        required: false
+        type: choice
+        options:
+          - mp4
+          - mkv
+          - webm
+        default: 'mp4'
+      frame_rate:
+        description: '🎥 Frame Rate (leave blank for original)'
+        required: false
+        type: string
+        default: ''
+      download_engine:
+        description: '⚙️ Download Engine'
+        required: false
+        type: choice
+        options:
+          - native
+          - api
+        default: 'native'
+      max_videos:
+        description: '🔢 Max results'
+        required: false
+        type: number
+        default: 10
+      split_threshold_mb:
+        description: '📦 Split > MB (0=no)'
+        required: false
+        type: number
+        default: 50
+      dry_run:
+        description: '🔍 Dry run (no download)'
+        required: false
+        type: boolean
+        default: false
+      embed_thumbnail:
+        description: '🖼️ Embed thumbnail into video (video mode)'
+        required: false
+        type: boolean
+        default: false
+      download_subtitles:
+        description: '💬 Download Persian/English subtitles'
+        required: false
+        type: boolean
+        default: true
+      # ─── Clean inputs ────────────────────────────────
+      confirm_delete:
+        description: '⚠️ Type "I CONFIRM" to delete all downloads'
+        required: false
+        type: string
+        default: ''
+
+env:
+  PYTHONUNBUFFERED: '1'
+  DEBIAN_FRONTEND: 'noninteractive'
+
+jobs:
+  # ─── Clean job ──────────────────────────────────────
+  clean-downloads:
+    if: github.event.inputs.action == 'clean' && github.event.inputs.confirm_delete == 'I CONFIRM'
+    name: 🧹 Clean downloads
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: 🗑️ Delete downloads folder
+        run: |
+          if [ -d "downloads" ]; then
+            rm -rf downloads
+            echo "downloads/ folder deleted."
+          else
+            echo "downloads/ folder does not exist, nothing to do."
+          fi
+
+      - name: 📤 Commit & Push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "bot@github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+          git commit -m "🧹 Clean downloads $(date +%m%d-%H%M)"
+          for i in 1 2 3 4 5; do
+            if git pull --rebase --quiet && git push --quiet; then
+              echo "Push successful."
+              exit 0
+            fi
+            sleep $((i*5))
+          done
+          echo "Push failed."; exit 1
+
+  # ─── Download jobs ──────────────────────────────────
+  process-basic:
+    if: github.event.inputs.action == 'download' && (github.event.inputs.mode == 'single' || github.event.inputs.mode == 'search' || github.event.inputs.mode == 'batch')
+    name: 🚀 ${{ github.event.inputs.mode }} mode
+    runs-on: ${{ github.event.inputs.runner || 'ubuntu-latest' }}
+    timeout-minutes: 240
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: 🧰 System dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq aria2 p7zip-full ffmpeg
+
+      - name: 🐍 Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 💾 Cache uv
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/uv
+          key: uv-${{ runner.os }}-${{ hashFiles('scripts/requirements.txt') }}
+
+      - name: ⚡ Install Python deps with uv
+        run: |
+          python3 -m pip install uv
+          uv pip install --system -r scripts/requirements.txt || pip install -r scripts/requirements.txt
+
+      - name: 🎯 Run
+        run: python3 scripts/main.py
+
+      - name: 📤 Commit & Push
+        run: bash scripts/push.sh
+
+  # ─── Playlist/Channel with matrix ───────────────────
+  prep-playlist:
+    if: github.event.inputs.action == 'download' && (github.event.inputs.mode == 'playlist' || github.event.inputs.mode == 'channel')
+    name: 📋 Prepare playlist/channel
+    runs-on: ${{ github.event.inputs.runner || 'ubuntu-latest' }}
+    outputs:
+      chunk_count: ${{ steps.preflight.outputs.chunk_count }}
+      chunk_indices: ${{ steps.preflight.outputs.chunk_indices }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: 🧰 System dependencies
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq aria2
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/uv
+          key: uv-${{ runner.os }}-${{ hashFiles('scripts/requirements.txt') }}
+
+      - name: ⚡ Install Python deps
+        run: |
+          python3 -m pip install uv
+          uv pip install --system -r scripts/requirements.txt || pip install -r scripts/requirements.txt
+
+      - name: 🔍 Extract video IDs & chunk
+        id: preflight
+        run: python3 scripts/main.py --preflight
+
+      - name: 📤 Upload video list artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: video-list
+          path: /tmp/video_list.json
+          retention-days: 1
+
+  download-chunks:
+    needs: prep-playlist
+    name: 🧩 Chunk ${{ matrix.chunk }}
+    runs-on: ${{ github.event.inputs.runner || 'ubuntu-latest' }}
+    strategy:
+      matrix:
+        chunk: ${{ fromJson(needs.prep-playlist.outputs.chunk_indices) }}
+    timeout-minutes: 240
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: 🧰 System dependencies
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq aria2 p7zip-full ffmpeg
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/uv
+          key: uv-${{ runner.os }}-${{ hashFiles('scripts/requirements.txt') }}
+
+      - name: ⚡ Install Python deps
+        run: |
+          python3 -m pip install uv
+          uv pip install --system -r scripts/requirements.txt || pip install -r scripts/requirements.txt
+
+      - name: 📥 Download artifact (video list)
+        uses: actions/download-artifact@v4
+        with:
+          name: video-list
+          path: /tmp
+
+      - name: 📦 Download chunk
+        run: python3 scripts/main.py --download-chunk ${{ matrix.chunk }}
+
+      - name: 📤 Upload chunk artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: chunk-${{ matrix.chunk }}
+          path: /tmp/chunk_output/
+          retention-days: 1
+
+  assemble:
+    needs: download-chunks
+    if: ${{ always() && needs.download-chunks.result != 'failure' }}
+    name: 🧩 Assemble & Push
+    runs-on: ${{ github.event.inputs.runner || 'ubuntu-latest' }}
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: 🧰 System dependencies
+        run: sudo apt-get install -y -qq p7zip-full
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: ⚡ Install Python deps
+        run: |
+          python3 -m pip install uv
+          uv pip install --system -r scripts/requirements.txt || pip install -r scripts/requirements.txt
+
+      - name: 📥 Download all chunk artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/all_chunks
+          pattern: chunk-*
+
+      - name: 📥 Download video list artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: video-list
+          path: /tmp
+
+      - name: 🧩 Merge chunks & generate final index
+        run: python3 scripts/main.py --assemble
+
+      - name: 📤 Commit & Push
+        run: bash scripts/push.sh
