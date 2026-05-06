@@ -2,11 +2,10 @@
 import json
 import csv
 from pathlib import Path
-from typing import List, Dict
 from datetime import datetime
+from typing import List, Dict
 
 def generate_markdown_index(entries: List[Dict], output_path: Path, title: str, mode: str):
-    """entries: list of dicts with keys: index, title, channel, duration_str, views_str, thumbnail, url, filepath"""
     now = datetime.now().strftime('%Y-%m-%d %H:%M')
     md = f"# {title}\n\n**{now}** | **Mode: {mode}** | **{len(entries)} videos**\n\n"
     md += "| # | Thumbnail | Title | Duration | Views | File |\n"
