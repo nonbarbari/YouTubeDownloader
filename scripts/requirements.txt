@@ -1,2 +1,3 @@
 # scripts/requirements.txt
 yt-dlp>=2024.0.0
+requests
